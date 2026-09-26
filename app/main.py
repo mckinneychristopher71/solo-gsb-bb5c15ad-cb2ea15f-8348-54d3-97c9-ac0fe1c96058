@@ -16,11 +16,12 @@ from .redaction import (
     mask_text,
     migrate_fragment,
     select_fragments,
+    select_fragments_with_budget,
 )
 
 app = FastAPI(
     title="敏感片段遮盖 API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "提交原文及候选片段（含唯一 ID、正整数权重、左闭右开码点区间），"
         "返回互不重叠的最优入选组合、落选 ID 与等长遮盖文本。"
@@ -74,6 +75,32 @@ REDACT_REQUEST_SCHEMA = {
             {"id": 1, "weight": 5, "start": 0, "end": 2},
             {"id": 2, "weight": 3, "start": 3, "end": 5},
         ],
+    },
+}
+
+
+# /redact/budget 的请求体 JSON Schema；text、fragments 与 /redact 完全一致，
+# 另需非负整数 max_masked_chars。
+BUDGET_REQUEST_SCHEMA = {
+    "type": "object",
+    "required": ["text", "fragments", "max_masked_chars"],
+    "properties": {
+        "text": REDACT_REQUEST_SCHEMA["properties"]["text"],
+        "fragments": REDACT_REQUEST_SCHEMA["properties"]["fragments"],
+        "max_masked_chars": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "遮盖码点总数预算；为 0 时返回未遮盖原文",
+        },
+    },
+    "example": {
+        "text": "你好，世界！",
+        "fragments": [
+            {"id": 1, "weight": 5, "start": 0, "end": 3},
+            {"id": 2, "weight": 3, "start": 0, "end": 2},
+            {"id": 3, "weight": 1, "start": 2, "end": 5},
+        ],
+        "max_masked_chars": 3,
     },
 }
 
@@ -133,6 +160,13 @@ class RedactOut(BaseModel):
     masked_text: str = Field(..., description="入选片段以等长 █ 遮盖后的正文")
 
 
+class BudgetRedactOut(BaseModel):
+    selected_ids: list[int | str] = Field(..., description="入选片段 ID（升序）")
+    rejected_ids: list[int | str] = Field(..., description="落选片段 ID（升序）")
+    masked_text: str = Field(..., description="入选片段以等长 █ 遮盖后的正文")
+    used_chars: int = Field(..., description="实际遮盖码点数（入选区间长度之和）")
+
+
 class ReviseOut(BaseModel):
     revised_text: str = Field(..., description="应用全部编辑后的原文")
     invalidated_ids: list[int | str] = Field(
@@ -161,6 +195,26 @@ def validate_payload(payload: Any) -> tuple[str, list[Fragment]]:
     if not isinstance(payload, dict):
         raise _bad("请求体必须是 JSON 对象，包含 text 与 fragments 字段")
     return _validate_text_and_fragments(payload)
+
+
+def validate_budget_payload(payload: Any) -> tuple[str, list[Fragment], int]:
+    """严格校验 /redact/budget 请求体，返回 ``(原文, Fragment 列表, 预算)``。
+
+    ``text`` 与 ``fragments`` 沿用 :func:`validate_payload` 的全部规则；
+    ``max_masked_chars`` 必须是非负整数（不接受 ``1.0``、``true``）。
+    """
+    if not isinstance(payload, dict):
+        raise _bad("请求体必须是 JSON 对象，包含 text、fragments 与 max_masked_chars 字段")
+    text, fragments = _validate_text_and_fragments(payload)
+
+    if "max_masked_chars" not in payload:
+        raise _bad("缺少字段：max_masked_chars")
+    budget = payload["max_masked_chars"]
+    if isinstance(budget, bool) or not isinstance(budget, int):
+        raise _bad("max_masked_chars 必须是非负整数")
+    if budget < 0:
+        raise _bad("max_masked_chars 不能为负数")
+    return text, fragments, budget
 
 
 def validate_revise_payload(payload: Any) -> tuple[str, list[Fragment], list[Edit]]:
@@ -344,6 +398,37 @@ async def redact(request: Request) -> RedactOut:
         selected_ids=list(selected),
         rejected_ids=[i for i in all_ids if i not in set(selected)],
         masked_text=masked,
+    )
+
+
+@app.post(
+    "/redact/budget",
+    response_model=BudgetRedactOut,
+    tags=["遮盖"],
+    summary="在遮盖码点预算内选择互不重叠片段并遮盖原文",
+    openapi_extra={"requestBody": {"content": {"application/json": {"schema": BUDGET_REQUEST_SCHEMA}}}},
+)
+async def redact_budget(request: Request) -> BudgetRedactOut:
+    try:
+        payload = await request.json()
+    except ValueError:
+        raise _bad("请求体不是合法的 JSON")
+    text, fragments, budget = validate_budget_payload(payload)
+
+    selected = select_fragments_with_budget(fragments, budget)
+
+    by_id = {f.id: f for f in fragments}
+    chosen = [by_id[fragment_id] for fragment_id in selected]
+    all_ids = sorted(f.id for f in fragments)
+    selected_set = set(selected)
+    used = sum(by_id[fragment_id].length for fragment_id in selected)
+
+    masked = mask_text(text, chosen)
+    return BudgetRedactOut(
+        selected_ids=list(selected),
+        rejected_ids=[i for i in all_ids if i not in selected_set],
+        masked_text=masked,
+        used_chars=used,
     )
 
 

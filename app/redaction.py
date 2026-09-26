@@ -159,6 +159,117 @@ def select_fragments(fragments: Sequence[Fragment]) -> tuple[ID, ...]:
     return dp[-1][2]
 
 
+def select_fragments_with_budget(
+    fragments: Sequence[Fragment], max_masked_chars: int
+) -> tuple[ID, ...]:
+    """预算受限版的 :func:`select_fragments`。
+
+    只在互不重叠（相邻可以）且入选片段长度之和——即遮盖码点总数——不超过
+    ``max_masked_chars`` 的组合中择优，目标优先级与 :func:`select_fragments`
+    完全相同：权重总和最大 → 遮盖码点数最多 → 入选 ID 升序列表字典序最小。
+
+    先求无约束最优：若其遮盖码点数已在预算内则直接复用，保证预算宽松时与
+    :func:`select_fragments` 结果一致；否则做带容量的带权区间调度 DP。
+    容量较小时按容量稠密递推，容量较大而片段较少时按已用码点数稀疏枚举。
+    """
+    if not fragments or max_masked_chars <= 0:
+        return ()
+
+    by_id = {f.id: f for f in fragments}
+    unconstrained = select_fragments(fragments)
+    if sum(by_id[i].length for i in unconstrained) <= max_masked_chars:
+        return unconstrained
+
+    ordered = sorted(fragments, key=lambda f: (f.end, f.start, f.id))
+    ends = [f.end for f in ordered]
+    n = len(ordered)
+
+    # 稠密递推每轮维护 budget+1 个容量格；稀疏枚举每轮至多 2^n 个可达和。
+    # 取格数估计较小者；n 较大时 2^n 截断为无穷，自然走稠密递推。
+    sparse_states = 1 << n if n < 32 else None
+    if sparse_states is None or (max_masked_chars + 1) <= sparse_states:
+        final_row = _budget_dp_dense(ordered, ends, max_masked_chars)
+        candidates = (state for state in final_row if state is not None)
+    else:
+        final_row = _budget_dp_sparse(ordered, ends, max_masked_chars)
+        candidates = final_row.values()
+
+    best: BudgetState | None = None
+    for state in candidates:
+        if best is None or _prefer_budget_state(state, best):
+            best = state
+    return best[2] if best is not None else ()
+
+
+# 预算 DP 状态：(权重总和, 遮盖码点数, 入选 ID 升序元组)。
+BudgetState = tuple[int, int, tuple[ID, ...]]
+
+
+def _prefer_budget_state(candidate: BudgetState, current: BudgetState) -> bool:
+    """``candidate`` 是否按（权重最大、码点数最多、ID 列表字典序最小）更优。"""
+    return candidate[:2] > current[:2] or (
+        candidate[:2] == current[:2] and candidate[2] < current[2]
+    )
+
+
+def _budget_dp_dense(
+    ordered: Sequence[Fragment], ends: Sequence[int], budget: int
+) -> list[BudgetState | None]:
+    """按容量稠密递推，返回末轮各“恰好使用码点数”上的最优状态。
+
+    ``dp[k][c]`` 为只考虑前 ``k`` 个片段、恰好遮盖 ``c`` 个码点时的最优
+    状态；第 ``i`` 个片段的相容前缀由 ``bisect_right`` 指向 ``dp[p]``。
+    """
+    dp: list[list[BudgetState | None]] = [
+        [(0, 0, ())] + [None] * budget
+    ]
+    for i, frag in enumerate(ordered, start=1):
+        p = bisect_right(ends, frag.start, 0, i - 1)
+        row: list[BudgetState | None] = list(dp[i - 1])  # 不选：继承前轮
+        base_row = dp[p]
+        length = frag.length
+        if length <= budget:
+            for used in range(budget + 1 - length):
+                base = base_row[used]
+                if base is None:
+                    continue
+                take: BudgetState = (
+                    base[0] + frag.weight,
+                    used + length,
+                    _insert_sorted(base[2], frag.id),
+                )
+                target = used + length
+                current = row[target]
+                if current is None or _prefer_budget_state(take, current):
+                    row[target] = take
+        dp.append(row)
+    return dp[-1]
+
+
+def _budget_dp_sparse(
+    ordered: Sequence[Fragment], ends: Sequence[int], budget: int
+) -> dict[int, BudgetState]:
+    """:func:`_budget_dp_dense` 的稀疏版本：只记录可达的已用码点数。"""
+    dp: list[dict[int, BudgetState]] = [{0: (0, 0, ())}]
+    for i, frag in enumerate(ordered, start=1):
+        p = bisect_right(ends, frag.start, 0, i - 1)
+        row = dict(dp[i - 1])  # 不选：继承前轮
+        for used, base in dp[p].items():
+            target = used + frag.length
+            if target > budget:
+                continue
+            take = (
+                base[0] + frag.weight,
+                target,
+                _insert_sorted(base[2], frag.id),
+            )
+            current = row.get(target)
+            if current is None or _prefer_budget_state(take, current):
+                row[target] = take
+        dp.append(row)
+    return dp[-1]
+
+
 def mask_text(text: str, fragments: Sequence[Fragment]) -> str:
     """用等长的 ``█`` 遮盖入选片段覆盖到的码点。
 
