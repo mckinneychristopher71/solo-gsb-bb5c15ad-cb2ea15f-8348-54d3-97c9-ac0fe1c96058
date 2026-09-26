@@ -159,6 +159,73 @@ def select_fragments(fragments: Sequence[Fragment]) -> tuple[ID, ...]:
     return dp[-1][2]
 
 
+def select_fragments_with_budget(
+    fragments: Sequence[Fragment], max_masked_chars: int
+) -> tuple[ID, ...]:
+    """从候选片段中选出遮盖码点总数不超过预算的最优互不重叠组合。
+
+    目标依次为：
+    1. 权重总和最大；
+    2. 权重总和并列时，遮盖码点总数最多；
+    3. 仍并列时，取入选 ID 升序列表字典序最小者。
+
+    与 :func:`select_fragments` 相比多一个预算约束：入选区间长度之和
+    （即遮盖码点数）不得超过 ``max_masked_chars``。相邻区间仍可同时入选。
+
+    使用按右端点排序的二维动态规划：``dp[i][b]`` 表示仅考虑前 ``i`` 个
+    片段、遮盖码点总数不超过 ``b`` 时的最优状态。时间复杂度
+    O(n * min(max_masked_chars, 全部区间长度之和))。
+
+    返回入选 ID 的升序元组。
+    """
+    if not fragments or max_masked_chars <= 0:
+        return ()
+
+    ordered = sorted(fragments, key=lambda f: (f.end, f.start, f.id))
+
+    # 预算不小于所有区间长度之和时与无预算约束等价，直接复用一维 DP。
+    if max_masked_chars >= sum(frag.length for frag in ordered):
+        return select_fragments(ordered)
+
+    ends = [frag.end for frag in ordered]
+
+    def better(
+        take: tuple[int, int, tuple[ID, ...]],
+        skip: tuple[int, int, tuple[ID, ...]],
+    ) -> bool:
+        # 前两项（权重、遮盖码点数）求最大，第三项 ID 升序列表取字典序最小。
+        return take[:2] > skip[:2] or (take[:2] == skip[:2] and take[2] < skip[2])
+
+    zero: tuple[int, int, tuple[ID, ...]] = (0, 0, ())
+    # rows[i][b]：仅考虑前 i 个片段、遮盖码点总数不超过 b 时的最优状态
+    #   (权重总和, 遮盖码点数, 入选 ID 升序元组)
+    rows: list[list[tuple[int, int, tuple[ID, ...]]]] = [
+        [zero] * (max_masked_chars + 1)
+    ]
+
+    for i, frag in enumerate(ordered, start=1):
+        # p：与第 i 个片段相容（end <= start）的最后一个片段下标。
+        p = bisect_right(ends, frag.start, 0, i - 1)
+        compatible_row = rows[p]
+        current: list[tuple[int, int, tuple[ID, ...]]] = []
+        for budget in range(max_masked_chars + 1):
+            skip = rows[i - 1][budget]
+            if budget < frag.length:
+                current.append(skip)
+                continue
+            base_weight, base_len, base_ids = compatible_row[budget - frag.length]
+            take = (
+                base_weight + frag.weight,
+                base_len + frag.length,
+                _insert_sorted(base_ids, frag.id),
+            )
+            current.append(take if better(take, skip) else skip)
+        rows.append(current)
+
+    return rows[-1][max_masked_chars][2]
+
+
+
 def mask_text(text: str, fragments: Sequence[Fragment]) -> str:
     """用等长的 ``█`` 遮盖入选片段覆盖到的码点。
 

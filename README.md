@@ -4,7 +4,8 @@
 **互不重叠**的前提下选出最优片段组合，并用等长的 `█`（U+2588 FULL BLOCK）
 遮盖原文。片段之间允许重叠（提交时无需预处理），相邻片段可同时入选。
 另提供 `POST /redact/revise`：先按码点区间编辑修订原文，自动作废旧片段、
-迁移保留片段，再完成选择与遮盖。
+迁移保留片段，再完成选择与遮盖；以及 `POST /redact/budget`：在给定的
+遮盖码点总预算内选择最优组合。
 
 ## 一条命令启动
 
@@ -111,6 +112,78 @@ curl -s http://localhost:8000/redact \
 - 空片段或反向区间（`start >= end`）；
 - 重复 ID；
 - 整数 ID 与字符串 ID 混用；
+- 请求体不是合法 JSON。
+
+### `POST /redact/budget`
+
+与 `POST /redact` 使用相同的 `text`、`fragments` 校验与等长 `█` 遮盖规则，
+另接收非负整数 `max_masked_chars`（遮盖码点总预算）。只在**互不重叠且
+遮盖码点总数不超过预算**的组合中，按与 `POST /redact` 相同的优先级
+（权重总和 → 遮盖码点数 → 入选 ID 升序列表字典序）选出结果，相邻区间
+仍可同时入选。返回结果额外包含实际遮盖码点数 `used_chars`。
+
+请求体（`Content-Type: application/json`）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `text` | string | 待处理原文（同 `POST /redact`） |
+| `fragments` | array | 候选片段列表，允许重叠（同 `POST /redact`） |
+| `max_masked_chars` | integer | 遮盖码点总预算，**非负整数**；为 `0` 时不遮盖任何码点，直接返回原文 |
+
+返回体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `selected_ids` | 入选片段 ID，按升序排列 |
+| `rejected_ids` | 落选片段 ID，按升序排列 |
+| `masked_text` | 入选片段覆盖的每个码点替换为一个 `█` 后的正文（长度与原文一致） |
+| `used_chars` | 入选片段实际遮盖的码点总数（区间长度之和，`<= max_masked_chars`） |
+
+#### 示例
+
+```bash
+curl -s http://localhost:8000/redact/budget \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "text": "abcdef",
+    "fragments": [
+      {"id": 1, "weight": 5, "start": 0, "end": 4},
+      {"id": 2, "weight": 3, "start": 0, "end": 2}
+    ],
+    "max_masked_chars": 3
+  }'
+```
+
+响应：
+
+```json
+{
+  "selected_ids": [2],
+  "rejected_ids": [1],
+  "masked_text": "██cdef",
+  "used_chars": 2
+}
+```
+
+片段 1（`[0,4)`）需遮盖 4 个码点，超出预算 3，即使权重更高也不能入选；
+片段 2（`[0,2)`）只需 2 个码点，在预算内取得最高权重总和。
+
+预算为零时返回未遮盖原文：
+
+```bash
+curl -s http://localhost:8000/redact/budget \
+  -H 'Content-Type: application/json' \
+  -d '{"text": "你好，世界！", "fragments": [
+    {"id": 1, "weight": 5, "start": 0, "end": 3}
+  ], "max_masked_chars": 0}'
+# {"selected_ids":[],"rejected_ids":[1],"masked_text":"你好，世界！","used_chars":0}
+```
+
+#### 校验规则（不合法请求返回 HTTP 400）
+
+- `max_masked_chars` 缺失，或不是非负整数
+  （不接受 `-1`、`1.0`、`true`、`"3"`、`null`；注意布尔值是整数子类也被拒绝）；
+- `text` / `fragments` 的校验规则与 `POST /redact` 完全一致；
 - 请求体不是合法 JSON。
 
 ### `POST /redact/revise`
@@ -242,9 +315,9 @@ uvicorn app.main:app --reload --port 8000   # 启动开发服务器
 pytest -q                                    # 运行测试
 ```
 
-测试包含核心算法（选择、遮盖、编辑应用、片段迁移）单元测试、两个 API 端点的
-端到端测试，以及 300 组随机用例下
-动态规划结果与 2^n 暴力枚举的对照校验。
+测试包含核心算法（选择、预算选择、遮盖、编辑应用、片段迁移）单元测试、
+三个 API 端点的端到端测试，以及各 300 组随机用例下
+动态规划结果与 2^n 暴力枚举（含带预算版本）的对照校验。
 
 ## 项目结构
 
